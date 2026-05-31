@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import warnings
 
 _bedrock_client: object | None = None
 _nova_model_id: str = ""
@@ -17,9 +18,9 @@ async def web_search(query: str) -> str:
     """Search the web.
 
     Pipeline:
-    1. DuckDuckGo (real-time results, always reliable)
-    2. Nova Pro synthesis agent (if available) — takes the raw DDG results and
-       produces a concise, well-organized answer.  Falls back to raw results.
+    1. ddgs (DuckDuckGo) for real-time results
+    2. Nova Pro synthesizes the snippets into a clean answer (optional)
+    Falls back to raw DDG output if Nova is unavailable or fails.
     """
     raw = await _ddg_search(query)
 
@@ -28,7 +29,7 @@ async def web_search(query: str) -> str:
         and _nova_model_id
         and raw
         and not raw.startswith("No results")
-        and not raw.startswith("DuckDuckGo search error")
+        and not raw.startswith("DuckDuckGo")
         and not raw.startswith("Web search unavailable")
     ):
         try:
@@ -36,22 +37,33 @@ async def web_search(query: str) -> str:
             if synthesized:
                 return synthesized
         except Exception:
-            pass  # return raw DDG results on any Nova failure
+            pass
 
     return raw
 
 
-async def _ddg_search(query: str, max_results: int = 8) -> str:
-    """DuckDuckGo via the duckduckgo-search Python package (no subprocess needed)."""
-    try:
-        from duckduckgo_search import DDGS  # noqa: PLC0415
-    except ImportError:
-        return "Web search unavailable: reinstall with `uv tool install -e . --reinstall`"
+def _run_ddg(query: str, max_results: int) -> list[dict]:
+    """Run DuckDuckGo search synchronously (called in a thread)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        # Try new package name (ddgs) first, fall back to duckduckgo_search
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS  # type: ignore[no-redef]
 
+    results = []
+    with DDGS() as ddgs:
+        for r in ddgs.text(query, max_results=max_results):
+            results.append(r)
+    return results
+
+
+async def _ddg_search(query: str, max_results: int = 8) -> str:
     try:
-        results: list[dict] = await asyncio.to_thread(
-            lambda: list(DDGS().text(query, max_results=max_results))
-        )
+        results: list[dict] = await asyncio.to_thread(_run_ddg, query, max_results)
+    except ImportError:
+        return "Web search unavailable: run `uv tool install -e . --reinstall` to get ddgs"
     except Exception as e:
         return f"DuckDuckGo search error: {e}"
 
@@ -67,8 +79,10 @@ async def _ddg_search(query: str, max_results: int = 8) -> str:
     return "\n\n".join(lines)
 
 
-async def _nova_synthesize(query: str, raw_results: str, client: object, nova_model_id: str) -> str:
-    """Use Nova Pro to synthesize raw DDG results into a clean answer."""
+async def _nova_synthesize(
+    query: str, raw_results: str, client: object, nova_model_id: str
+) -> str:
+    """Use Nova Pro to synthesize raw DDG snippets into a clean answer."""
     loop = asyncio.get_event_loop()
 
     system = [{
@@ -76,7 +90,7 @@ async def _nova_synthesize(query: str, raw_results: str, client: object, nova_mo
             "You are a search result analyst. Given a user query and raw search snippets, "
             "produce a concise, accurate, well-organized answer. "
             "Cite relevant URLs inline. Do not pad with filler. "
-            "Do not show thinking or reasoning — only the final answer."
+            "Only output the final answer — no thinking, no reasoning steps."
         )
     }]
     prompt = (
